@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/pkg/errors"
 	"github.com/wal-g/tracelog"
@@ -56,25 +55,13 @@ func (backupService *BackupService) DoBackup(backupName string, permanent bool) 
 		return err
 	}
 
-	backupCursor, err := backupService.MongodService.GetBackupCursor()
+	backupCursor, closeBackupCursor, err := backupService.MongodService.GetBackupCursor()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			closeErr := backupCursor.Close(backupService.Context)
-			if closeErr != nil {
-				tracelog.ErrorLogger.Printf("Unable to close backup cursor: %+v", closeErr)
-			}
-		}
-	}()
+	defer closeBackupCursor()
 
-	backupCursorCloseChannel := make(chan string)
-	defer func() {
-		backupCursorCloseChannel <- "Game Over"
-	}()
-
-	backupID, err := backupService.processBackupCursor(backupCursor, backupCursorCloseChannel)
+	backupID, err := backupService.processBackupCursor(backupCursor)
 	if err != nil {
 		return errors.Wrapf(err, "unable to process backup cursor")
 	}
@@ -107,9 +94,7 @@ func (backupService *BackupService) DoBackup(backupName string, permanent bool) 
 }
 
 // nolint: whitespace
-func (backupService *BackupService) processBackupCursor(backupCursor *mongo.Cursor,
-	closeChannel chan string) (*primitive.Binary, error) {
-
+func (backupService *BackupService) processBackupCursor(backupCursor *mongo.Cursor) (*primitive.Binary, error) {
 	var backupCursorMeta *BackupCursorMeta
 
 	for backupCursor.TryNext(backupService.Context) {
@@ -143,22 +128,6 @@ func (backupService *BackupService) processBackupCursor(backupCursor *mongo.Curs
 			}
 		}
 	}
-
-	go func() {
-		ticker := time.NewTicker(time.Minute * 1)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-closeChannel:
-				closeErr := backupCursor.Close(context.Background())
-				cursorErr := backupCursor.Err()
-				fmt.Printf("stop cursor polling: %v, cursor err: %v\n", closeErr, cursorErr)
-				return
-			case <-ticker.C:
-				backupCursor.TryNext(backupService.Context)
-			}
-		}
-	}()
 
 	return &backupCursorMeta.ID, nil
 }

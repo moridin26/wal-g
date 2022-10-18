@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -91,7 +92,7 @@ func (mongodService *MongodService) GetReplSetName() (string, error) {
 	return replSetNameHolder.ReplSetName, err
 }
 
-func (mongodService *MongodService) GetBackupCursor() (cursor *mongo.Cursor, err error) {
+func (mongodService *MongodService) GetBackupCursor() (cursor *mongo.Cursor, closeBackupCursor func(), err error) {
 	for i := 0; i < cursorCreateRetries; i++ {
 		cursor, err = mongodService.MongoClient.Database(adminDB).Aggregate(mongodService.Context, mongo.Pipeline{
 			{{Key: "$backupCursor", Value: bson.D{}}},
@@ -105,7 +106,36 @@ func (mongodService *MongodService) GetBackupCursor() (cursor *mongo.Cursor, err
 			time.Sleep(time.Minute * minutes)
 		}
 	}
-	return cursor, err
+
+	backupContext, stopPingBackupCursor := context.WithCancel(mongodService.Context)
+	var closeBackupCursorWg sync.WaitGroup
+	closeBackupCursorWg.Add(1)
+	go func() {
+		defer closeBackupCursorWg.Done()
+		ticker := time.NewTicker(time.Minute * 1)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-backupContext.Done():
+				tracelog.InfoLogger.Printf("stop process with ping the backup cursor")
+				return
+			case <-ticker.C:
+				hasNext := cursor.TryNext(backupContext)
+				tracelog.InfoLogger.Printf("ping the backup cursor (has next = %v", hasNext)
+			}
+		}
+	}()
+
+	closeBackupCursor = func() {
+		stopPingBackupCursor()
+		closeBackupCursorWg.Wait()
+		closeErr := cursor.Close(mongodService.Context)
+		if closeErr != nil {
+			tracelog.ErrorLogger.Printf("Unable to close backup cursor: %+v", closeErr)
+		}
+	}
+
+	return cursor, closeBackupCursor, err
 }
 
 func backupCursorErrorIsRetried(err error) bool {
